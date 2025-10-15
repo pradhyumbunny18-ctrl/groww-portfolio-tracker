@@ -67,33 +67,47 @@ def is_market_open():
     return now.weekday() < 5 and time(9, 15) <= now.time() <= time(15, 30)
 
 def fetch_live_prices(tickers):
-    """Fetch latest prices with robust error handling."""
+    """Fetch latest prices with robust error handling, prioritizing live data."""
     if not tickers:
         return {}
     prices = {}
     print(f"Attempting to fetch prices for tickers: {tickers}")
     try:
-        data = yf.download(tickers, period='2d', interval='1d', auto_adjust=False, prepost=True)
-        print(f"Raw data from yf.download: {data}")
-        if data.empty:
-            raise Exception("No data returned from yfinance")
-        latest_close = data['Close'].iloc[-1]
-        print(f"Latest close values: {latest_close}")
-        for ticker in tickers:
-            if ticker in latest_close.index:
-                prices[ticker] = latest_close[ticker]
+        # Try 1-day with 1-minute interval for live data
+        data = yf.download(tickers, period='1d', interval='1m', auto_adjust=False, prepost=True)
+        print(f"Raw data from yf.download (1m): {data}")
+        if not data.empty:
+            latest_close = data['Close'].iloc[-1]
+            print(f"Latest close values (1m): {latest_close}")
+            for ticker in tickers:
+                if ticker in latest_close.index:
+                    prices[ticker] = latest_close[ticker]
+        if not prices:  # Fallback to 2d if 1m fails
+            data = yf.download(tickers, period='2d', interval='1d', auto_adjust=False, prepost=True)
+            print(f"Raw data from yf.download (2d): {data}")
+            if not data.empty:
+                latest_close = data['Close'].iloc[-1]
+                print(f"Latest close values (2d): {latest_close}")
+                for ticker in tickers:
+                    if ticker in latest_close.index:
+                        prices[ticker] = latest_close[ticker]
             else:
-                prices[ticker] = holdings.get(ticker, {'avg_price': 0})['avg_price']
+                raise Exception("No data from 2d fetch")
     except Exception as e:
         print(f"Fetch error for all tickers: {e}")
         for ticker in tickers:
             try:
-                ticker_data = yf.download(ticker, period='2d', interval='1d', auto_adjust=False, prepost=True)
-                print(f"Individual data for {ticker}: {ticker_data}")
+                ticker_data = yf.download(ticker, period='1d', interval='1m', auto_adjust=False, prepost=True)
+                print(f"Individual data for {ticker} (1m): {ticker_data}")
                 if not ticker_data.empty:
                     prices[ticker] = ticker_data['Close'].iloc[-1]
                 else:
-                    prices[ticker] = holdings.get(ticker, {'avg_price': 0})['avg_price']
+                    ticker_data = yf.download(ticker, period='2d', interval='1d', auto_adjust=False, prepost=True)
+                    print(f"Individual data for {ticker} (2d): {ticker_data}")
+                    if not ticker_data.empty:
+                        prices[ticker] = ticker_data['Close'].iloc[-1]
+                    else:
+                        prices[ticker] = holdings.get(ticker, {'avg_price': 0})['avg_price']
             except Exception as te:
                 print(f"Fetch error for {ticker}: {te}")
                 prices[ticker] = holdings.get(ticker, {'avg_price': 0})['avg_price']
