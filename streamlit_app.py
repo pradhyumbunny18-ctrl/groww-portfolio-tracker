@@ -43,20 +43,40 @@ def is_market_open():
     return now.weekday() < 5 and time(9, 15) <= now.time() <= time(15, 30)
 
 def fetch_live_prices(tickers):
+    prices = {}
     try:
         if not is_market_open():
-            data = yf.download(tickers, period='2d', interval='1d')['Close'].iloc[-1]
+            data = yf.download(tickers, period='2d', interval='1d', prepost=True)['Close'].iloc[-1]
         else:
-            data = yf.download(tickers, period='1d', interval='1m')['Close'].iloc[-1]
-        return dict(zip(tickers, data))
+            data = yf.download(tickers, period='1d', interval='1m', prepost=True)['Close'].iloc[-1]
+        # Map prices to tickers
+        for ticker in tickers:
+            if ticker in data.index:
+                prices[ticker] = data[ticker]
+            else:
+                # Fallback: Fetch IPL (or any missing) individually
+                try:
+                    fallback_data = yf.Ticker(ticker).history(period='1d')['Close'].iloc[-1]
+                    prices[ticker] = fallback_data
+                    print(f"Fallback fetch for {ticker}: {fallback_data}")  # Debug log
+                except:
+                    prices[ticker] = None  # Still use avg_price fallback in build_df
+        print(f"Fetched prices: {prices}")  # Debug: Check terminal
+        return prices
     except Exception as e:
-        st.error(f"Price fetch error: {e}")
-        return {t: holdings[t]['avg_price'] for t in tickers if t in holdings}
+        st.error(f"Bulk fetch error: {e}")
+        # Full fallback to individual fetches if bulk fails
+        for ticker in tickers:
+            try:
+                prices[ticker] = yf.Ticker(ticker).history(period='1d')['Close'].iloc[-1]
+            except:
+                prices[ticker] = None
+        return prices
 
 def build_holdings_df(tickers, holdings):
     prices = fetch_live_prices(tickers)
     df_data = []
-    numeric_data = []  # For safe calculations
+    numeric_data = []
     for ticker in tickers:
         if ticker in holdings:
             h = holdings[ticker]
