@@ -44,63 +44,51 @@ def is_market_open():
 
 def fetch_live_prices(tickers):
     prices = {}
-    try:
-        if not is_market_open():
-            data = yf.download(tickers, period='2d', interval='1d', prepost=True)['Close'].iloc[-1]
-        else:
-            data = yf.download(tickers, period='1d', interval='1m', prepost=True)['Close'].iloc[-1]
-        # Map prices to tickers
-        for ticker in tickers:
-            if ticker in data.index:
-                prices[ticker] = data[ticker]
+    for ticker in tickers:
+        try:
+            # Individual fetch for reliability
+            stock_data = yf.Ticker(ticker).history(period='1d', interval='1m' if is_market_open() else '1d', prepost=True)
+            if not stock_data.empty:
+                ltp = stock_data['Close'].iloc[-1]
+                prices[ticker] = ltp
+                print(f"Successfully fetched {ticker}: {ltp:.2f}")  # Debug log
             else:
-                # Fallback: Fetch IPL (or any missing) individually
-                try:
-                    fallback_data = yf.Ticker(ticker).history(period='1d')['Close'].iloc[-1]
-                    prices[ticker] = fallback_data
-                    print(f"Fallback fetch for {ticker}: {fallback_data}")  # Debug log
-                except:
-                    prices[ticker] = None  # Still use avg_price fallback in build_df
-        print(f"Fetched prices: {prices}")  # Debug: Check terminal
-        return prices
-    except Exception as e:
-        st.error(f"Bulk fetch error: {e}")
-        # Full fallback to individual fetches if bulk fails
-        for ticker in tickers:
-            try:
-                prices[ticker] = yf.Ticker(ticker).history(period='1d')['Close'].iloc[-1]
-            except:
-                prices[ticker] = None
-        return prices
+                raise ValueError("Empty data")
+        except Exception as e:
+            print(f"Error fetching {ticker}: {e}. Using fallback.")  # Debug
+            prices[ticker] = None  # Will fallback to avg_price in build_df
+    return prices
 
 def build_holdings_df(tickers, holdings):
     prices = fetch_live_prices(tickers)
     df_data = []
-    numeric_data = []
     for ticker in tickers:
         if ticker in holdings:
             h = holdings[ticker]
-            ltp = prices.get(ticker, h['avg_price'])
+            ltp = prices.get(ticker, h['avg_price'])  # Fallback to avg if fetch fails
             invested = h['qty'] * h['avg_price']
             current_value = h['qty'] * ltp
             unrealized_pl = current_value - invested
+            pct_chg = ((ltp - h['avg_price']) / h['avg_price']) * 100 if h['avg_price'] != 0 else 0
             df_data.append({
                 'Ticker': ticker.replace('.NS', ''),
                 'Net Qty': h['qty'],
-                'Avg Price': f"{h['avg_price']:.2f}",
-                'Live Price': f"{ltp:.2f}",
-                'Invested': f"{invested:.2f}",
-                'Current Value': f"{current_value:.2f}",
-                'Unrealized P/L': f"{unrealized_pl:.2f}"
-            })
-            numeric_data.append({
+                'Avg Price': h['avg_price'],
+                'Live Price': ltp,
                 'Invested': invested,
                 'Current Value': current_value,
-                'Unrealized P/L': unrealized_pl
+                'Unrealized P/L': unrealized_pl,
+                '%Chg': pct_chg
             })
     df = pd.DataFrame(df_data)
-    df_numeric = pd.DataFrame(numeric_data)
-    return df.sort_values('Current Value', ascending=False), df_numeric
+    # Ensure numeric columns for proper sorting
+    numeric_cols = ['Avg Price', 'Live Price', 'Invested', 'Current Value', 'Unrealized P/L', '%Chg']
+    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+    # Sort numerically by Current Value descending
+    df = df.sort_values('Current Value', ascending=False)
+    # Calculate Allocation %
+    df['Allocation %'] = (df['Current Value'] / df['Current Value'].sum()) * 100
+    return df, df.copy()  # Return numeric df and its copy
 
 # Auto-refresh
 if 'last_update' not in st.session_state:
@@ -118,17 +106,29 @@ if (datetime.now() - st.session_state.last_update).seconds >= 30:
 # Live dashboard
 df, df_numeric = build_holdings_df(tickers, holdings)
 
-st.dataframe(df)
+# Format for display (keep original df numeric for charts)
+display_df = df.copy()
+display_df['Avg Price'] = display_df['Avg Price'].apply(lambda x: f"{x:.2f}")
+display_df['Live Price'] = display_df['Live Price'].apply(lambda x: f"{x:.2f}")
+display_df['Invested'] = display_df['Invested'].apply(lambda x: f"{x:.2f}")
+display_df['Current Value'] = display_df['Current Value'].apply(lambda x: f"{x:.2f}")
+display_df['Unrealized P/L'] = display_df['Unrealized P/L'].apply(lambda x: f"{x:.2f}")
+display_df['%Chg'] = display_df['%Chg'].apply(lambda x: f"{x:.2f}")
+display_df['Allocation %'] = display_df['Allocation %'].apply(lambda x: f"{x:.2f}")
+# Display the formatted DataFrame
+st.dataframe(display_df)
 
 # Charts
-fig_pie = px.pie(df, values='Current Value', names='Ticker', title='Allocation %')
+fig_pie = px.pie(df, values='Allocation %', names='Ticker', title='Allocation %')
 st.plotly_chart(fig_pie)
 
-fig_line = px.bar(df, x='Ticker', y='Unrealized P/L', title='Returns %')
+# Bar Chart
+fig_line = px.bar(df, x='Ticker', y='%Chg', title='Returns %')
 st.plotly_chart(fig_line)
 
 # Trend
 multi_data = yf.download(tickers, period="1mo")['Close']
+st.write("Trend Data:", multi_data)  # Debug
 fig_trend = px.line(multi_data, title='1-Month Performance Trend')
 st.plotly_chart(fig_trend)
 
