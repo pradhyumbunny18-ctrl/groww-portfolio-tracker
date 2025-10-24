@@ -7,11 +7,10 @@ from datetime import datetime, time
 from collections import defaultdict
 
 # ----------------------------------------------------------------------
-# Page Config & Theme Toggle (Bonus 1)
+# Page Config & Theme Toggle
 # ----------------------------------------------------------------------
 st.set_page_config(page_title="My Groww Portfolio Tracker", layout="wide")
 
-# Dark/Light Mode Toggle
 theme = st.sidebar.selectbox("Theme", ["Light", "Dark"], index=0)
 if theme == "Dark":
     st.markdown("<style>body {background-color: #0e1117; color: white;}</style>", unsafe_allow_html=True)
@@ -75,49 +74,48 @@ def is_market_open():
 
 
 # ----------------------------------------------------------------------
-# 3. Fetch live prices (robust + Nifty 50)
+# 3. Fetch live prices (robust + TATAMOTORS fix)
 # ----------------------------------------------------------------------
-@st.cache_data(ttl=30)  # Cache prices for 30s
+@st.cache_data(ttl=30)
 def fetch_live_prices(tickers):
     prices = {}
-    all_tickers = tickers + ['^NSEI']  # Add Nifty 50
+    all_tickers = tickers + ['^NSEI']
 
-    try:
-        print("Batch fetching all prices...")
-        batch_data = yf.download(all_tickers, period='1d', interval='1m' if is_market_open() else '1d', prepost=True, progress=False)
-        if not batch_data.empty and 'Close' in batch_data:
-            for ticker in all_tickers:
-                col = batch_data['Close'][ticker]
-                if not col.dropna().empty:
-                    prices[ticker] = float(col.dropna().iloc[-1])
-                    print(f"Success: {ticker} = {prices[ticker]:.2f}")
-    except Exception as e:
-        print(f"Batch failed: {e}")
-
-    # Individual retry
     for ticker in all_tickers:
-        if ticker not in prices:
-            for _ in range(2):
-                try:
-                    data = yf.Ticker(ticker).history(period='1d', interval='1m' if is_market_open() else '1d')
-                    if not data.empty:
-                        prices[ticker] = float(data['Close'].iloc[-1])
-                        break
-                except:
-                    time.sleep(2)
-            else:
-                prices[ticker] = None
+        if 'TATAMOTORS' in ticker.upper():
+            alt_tickers = ['TATAMOTORS.NS', 'TATAMOTORS.BO', 'TATAMOTORS']
+        else:
+            alt_tickers = [ticker]
+
+        found = False
+        for alt in alt_tickers:
+            try:
+                data = yf.Ticker(alt).history(period='1d', interval='1m' if is_market_open() else '1d')
+                if not data.empty and 'Close' in data:
+                    ltp = float(data['Close'].iloc[-1])
+                    prices[ticker] = ltp
+                    print(f"Success: {ticker} → {alt} = {ltp:.2f}")
+                    found = True
+                    break
+            except:
+                continue
+        if not found:
+            prices[ticker] = None
+            print(f"Failed: {ticker}")
 
     return prices
 
 
 # ----------------------------------------------------------------------
-# 4. Build DataFrame + Nifty Benchmark
+# 4. Build DataFrame + Nifty Benchmark (FIXED)
 # ----------------------------------------------------------------------
 def build_holdings_df(tickers, holdings):
     prices = fetch_live_prices(tickers)
     nifty_ltp = prices.get('^NSEI')
-    nifty_start = yf.Ticker('^NSEI').history(period='1d')['Close'].iloc[0] if nifty_ltp else None
+
+    # FIXED: Safe Nifty start price
+    nifty_data = yf.Ticker('^NSEI').history(period='1d')
+    nifty_start = nifty_data['Close'].iloc[0] if not nifty_data.empty else None
     nifty_change = ((nifty_ltp - nifty_start) / nifty_start * 100) if nifty_start and nifty_ltp else 0
 
     rows = []
@@ -195,10 +193,8 @@ for c in fmt_cols:
 
 st.dataframe(display_df, use_container_width=True)
 
-# Export Button (Bonus 2)
+# Export Button
 excel_data = df.copy()
-excel_data['Live Price'] = excel_data['Live Price'].round(2)
-excel_data['Invested'] = excel_data['Invested'].round(2)
 st.download_button(
     label="Download Portfolio as Excel",
     data=excel_data.to_csv(index=False).encode(),
@@ -215,7 +211,7 @@ with col2:
     fig_bar = px.bar(df, x='Ticker', y='%Chg', title='Returns %', color='%Chg', color_continuous_scale='RdYlGn')
     st.plotly_chart(fig_bar, use_container_width=True)
 
-# Trend + Nifty Benchmark (Bonus 3)
+# Trend
 try:
     trend_data = yf.download(tickers + ['^NSEI'], period="1mo", progress=False)['Close']
     fig_trend = px.line(trend_data, title='1-Month Trend vs Nifty 50')
@@ -223,7 +219,7 @@ try:
 except:
     st.warning("Trend chart unavailable")
 
-# Metrics + Nifty (Bonus 4)
+# Metrics
 status = " (Live)" if is_market_open() else " (Closed)"
 st.caption(f"Updated: {st.session_state.last_update.strftime('%Y-%m-%d %H:%M:%S')}{status}")
 
