@@ -2,10 +2,22 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import yfinance as yf
+import time
 from datetime import datetime, time
 from collections import defaultdict
 
+# ----------------------------------------------------------------------
+# Page Config & Theme Toggle (Bonus 1)
+# ----------------------------------------------------------------------
 st.set_page_config(page_title="My Groww Portfolio Tracker", layout="wide")
+
+# Dark/Light Mode Toggle
+theme = st.sidebar.selectbox("Theme", ["Light", "Dark"], index=0)
+if theme == "Dark":
+    st.markdown("<style>body {background-color: #0e1117; color: white;}</style>", unsafe_allow_html=True)
+else:
+    st.markdown("<style>body {background-color: white; color: black;}</style>", unsafe_allow_html=True)
+
 st.title("My Groww Portfolio Tracker")
 
 
@@ -15,22 +27,14 @@ st.title("My Groww Portfolio Tracker")
 def load_holdings():
     try:
         holdings_df = pd.read_csv('holdings.csv')
-
-        # ---- Force numeric on the raw columns ----
         holdings_df['quantity'] = pd.to_numeric(holdings_df['quantity'], errors='coerce')
         holdings_df['avg_price'] = pd.to_numeric(holdings_df['avg_price'], errors='coerce')
 
-        # ---- Warn about bad rows ----
         bad_qty = holdings_df['quantity'].isna()
         bad_price = holdings_df['avg_price'].isna()
         if bad_qty.any() or bad_price.any():
-            st.warning(
-                f"Some rows in holdings.csv have invalid numbers:\n"
-                f"• Bad quantity: {bad_qty.sum()} rows\n"
-                f"• Bad avg_price: {bad_price.sum()} rows"
-            )
+            st.warning(f"Invalid data in holdings.csv: {bad_qty.sum()} bad qty, {bad_price.sum()} bad price")
 
-        # ---- Aggregate buys only ----
         agg = defaultdict(lambda: {'total_qty': 0, 'total_cost': 0})
         for _, row in holdings_df.iterrows():
             if row['type'] == 'Buy':
@@ -71,53 +75,67 @@ def is_market_open():
 
 
 # ----------------------------------------------------------------------
-# 3. Fetch live prices (robust)
+# 3. Fetch live prices (robust + Nifty 50)
 # ----------------------------------------------------------------------
+@st.cache_data(ttl=30)  # Cache prices for 30s
 def fetch_live_prices(tickers):
     prices = {}
-    for ticker in tickers:
-        try:
-            data = yf.Ticker(ticker).history(
-                period='1d',
-                interval='1m' if is_market_open() else '1d',
-                prepost=True
-            )
-            if not data.empty:
-                ltp = float(data['Close'].iloc[-1])
-                prices[ticker] = ltp
-                print(f"Fetched {ticker}: {ltp:.2f}")
+    all_tickers = tickers + ['^NSEI']  # Add Nifty 50
+
+    try:
+        print("Batch fetching all prices...")
+        batch_data = yf.download(all_tickers, period='1d', interval='1m' if is_market_open() else '1d', prepost=True, progress=False)
+        if not batch_data.empty and 'Close' in batch_data:
+            for ticker in all_tickers:
+                col = batch_data['Close'][ticker]
+                if not col.dropna().empty:
+                    prices[ticker] = float(col.dropna().iloc[-1])
+                    print(f"Success: {ticker} = {prices[ticker]:.2f}")
+    except Exception as e:
+        print(f"Batch failed: {e}")
+
+    # Individual retry
+    for ticker in all_tickers:
+        if ticker not in prices:
+            for _ in range(2):
+                try:
+                    data = yf.Ticker(ticker).history(period='1d', interval='1m' if is_market_open() else '1d')
+                    if not data.empty:
+                        prices[ticker] = float(data['Close'].iloc[-1])
+                        break
+                except:
+                    time.sleep(2)
             else:
-                raise ValueError("Empty dataframe")
-        except Exception as e:
-            print(f"Failed {ticker}: {e}")
-            prices[ticker] = None
+                prices[ticker] = None
+
     return prices
 
 
 # ----------------------------------------------------------------------
-# 4. Build the main DataFrame (SAFE)
+# 4. Build DataFrame + Nifty Benchmark
 # ----------------------------------------------------------------------
 def build_holdings_df(tickers, holdings):
-    live_prices = fetch_live_prices(tickers)
+    prices = fetch_live_prices(tickers)
+    nifty_ltp = prices.get('^NSEI')
+    nifty_start = yf.Ticker('^NSEI').history(period='1d')['Close'].iloc[0] if nifty_ltp else None
+    nifty_change = ((nifty_ltp - nifty_start) / nifty_start * 100) if nifty_start and nifty_ltp else 0
 
     rows = []
     for ticker in tickers:
         if ticker not in holdings:
             continue
-
         h = holdings[ticker]
-
-        # ---- Ensure qty & avg_price are float ----
         qty = float(h['qty'])
         avg_price = float(h['avg_price'])
+        ltp = prices.get(ticker)
 
-        # ---- Live price with fallback ----
-        ltp = live_prices.get(ticker)
         if ltp is None or pd.isna(ltp):
-            st.warning(f"Live price unavailable for {ticker}. Using Avg Price.")
+            st.warning(f"Live price unavailable for {ticker}. Using Avg ₹{avg_price:.2f}.")
             ltp = avg_price
+            status = "Avg Fallback"
         else:
             ltp = float(ltp)
+            status = "Live"
 
         invested = qty * avg_price
         current_value = qty * ltp
@@ -132,30 +150,24 @@ def build_holdings_df(tickers, holdings):
             'Invested': invested,
             'Current Value': current_value,
             'Unrealized P/L': unrealized_pl,
-            '%Chg': pct_chg
+            '%Chg': pct_chg,
+            'Status': status
         })
 
     df = pd.DataFrame(rows)
-
-    # ---- Numeric conversion (safe) ----
-    numeric_cols = ['Avg Price', 'Live Price', 'Invested',
-                    'Current Value', 'Unrealized P/L', '%Chg', 'Net Qty']
+    numeric_cols = ['Avg Price', 'Live Price', 'Invested', 'Current Value', 'Unrealized P/L', '%Chg', 'Net Qty']
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
 
-    # ---- Allocation % (after numeric) ----
     total_current = df['Current Value'].sum()
     df['Allocation %'] = (df['Current Value'] / total_current * 100).round(2)
-
-    # ---- Sort by Current Value descending ----
     df = df.sort_values('Current Value', ascending=False).reset_index(drop=True)
-
-    # Return a clean numeric copy for charts/metrics
     df_numeric = df.copy()
-    return df, df_numeric
+
+    return df, df_numeric, nifty_change
 
 
 # ----------------------------------------------------------------------
-# 5. Auto-refresh logic
+# 5. Auto-refresh
 # ----------------------------------------------------------------------
 if 'last_update' not in st.session_state:
     st.session_state.last_update = datetime.now()
@@ -165,56 +177,64 @@ if st.sidebar.button("Manual Refresh"):
     st.session_state.last_update = datetime.now()
     st.rerun()
 
-# Auto-refresh every 30 seconds
 if (datetime.now() - st.session_state.last_update).total_seconds() >= 30:
     st.session_state.last_update = datetime.now()
     st.rerun()
 
 
 # ----------------------------------------------------------------------
-# 6. Build dashboard
+# 6. Dashboard
 # ----------------------------------------------------------------------
-df, df_numeric = build_holdings_df(tickers, holdings)
+df, df_numeric, nifty_change = build_holdings_df(tickers, holdings)
 
-# ---- Pretty display (strings) ----
+# Pretty display
 display_df = df.copy()
-fmt_cols = ['Avg Price', 'Live Price', 'Invested', 'Current Value',
-            'Unrealized P/L', '%Chg', 'Allocation %']
+fmt_cols = ['Avg Price', 'Live Price', 'Invested', 'Current Value', 'Unrealized P/L', '%Chg', 'Allocation %']
 for c in fmt_cols:
     display_df[c] = display_df[c].apply(lambda x: f"{x:.2f}")
 
 st.dataframe(display_df, use_container_width=True)
 
+# Export Button (Bonus 2)
+excel_data = df.copy()
+excel_data['Live Price'] = excel_data['Live Price'].round(2)
+excel_data['Invested'] = excel_data['Invested'].round(2)
+st.download_button(
+    label="Download Portfolio as Excel",
+    data=excel_data.to_csv(index=False).encode(),
+    file_name=f"portfolio_{datetime.now().strftime('%Y%m%d')}.csv",
+    mime="text/csv"
+)
 
-# ---- Charts ----
-fig_pie = px.pie(df, values='Allocation %', names='Ticker',
-                 title='Portfolio Allocation %')
-st.plotly_chart(fig_pie, use_container_width=True)
+# Charts
+col1, col2 = st.columns(2)
+with col1:
+    fig_pie = px.pie(df, values='Allocation %', names='Ticker', title='Portfolio Allocation')
+    st.plotly_chart(fig_pie, use_container_width=True)
+with col2:
+    fig_bar = px.bar(df, x='Ticker', y='%Chg', title='Returns %', color='%Chg', color_continuous_scale='RdYlGn')
+    st.plotly_chart(fig_bar, use_container_width=True)
 
-fig_bar = px.bar(df, x='Ticker', y='%Chg', title='Returns % by Stock',
-                 color='%Chg', color_continuous_scale='RdYlGn')
-st.plotly_chart(fig_bar, use_container_width=True)
-
-# 1-month trend
+# Trend + Nifty Benchmark (Bonus 3)
 try:
-    trend_data = yf.download(tickers, period="1mo", progress=False)['Close']
-    fig_trend = px.line(trend_data, title='1-Month Price Trend')
+    trend_data = yf.download(tickers + ['^NSEI'], period="1mo", progress=False)['Close']
+    fig_trend = px.line(trend_data, title='1-Month Trend vs Nifty 50')
     st.plotly_chart(fig_trend, use_container_width=True)
-except Exception as e:
-    st.warning(f"Trend chart unavailable: {e}")
+except:
+    st.warning("Trend chart unavailable")
 
-
-# ---- Metrics ----
-status = " (Live)" if is_market_open() else " (Closed - Last Close)"
+# Metrics + Nifty (Bonus 4)
+status = " (Live)" if is_market_open() else " (Closed)"
 st.caption(f"Updated: {st.session_state.last_update.strftime('%Y-%m-%d %H:%M:%S')}{status}")
 
 total_invested = df_numeric['Invested'].sum()
 total_value = df_numeric['Current Value'].sum()
-total_return_pct = (df_numeric['Unrealized P/L'].sum() / total_invested * 100) \
-    if total_invested != 0 else 0.0
+total_return_pct = (df_numeric['Unrealized P/L'].sum() / total_invested * 100) if total_invested != 0 else 0.0
 
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 with col1:
-    st.metric("Total Return", f"{total_return_pct:+.2f}%")
+    st.metric("Total Return", f"{total_return_pct:+.2f}%", delta=f"{total_return_pct:+.2f}%")
 with col2:
     st.metric("Portfolio Value", f"₹{total_value:,.2f}")
+with col3:
+    st.metric("Nifty 50", f"{nifty_change:+.2f}%", delta=f"{nifty_change:+.2f}%")
