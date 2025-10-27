@@ -5,6 +5,7 @@ import yfinance as yf
 import requests
 from datetime import datetime, time
 from collections import defaultdict
+import numpy as np  # For NaN handling
 
 # ----------------------------------------------------------------------
 # Page Config & Theme
@@ -87,16 +88,8 @@ def fetch_live_prices(tickers):
             data = yf.Ticker(fetch_ticker).history(period='1d', interval='1m' if is_market_open() else '1d')
             if not data.empty and 'Close' in data.columns:
                 ltp = float(data['Close'].iloc[-1])
-                # Optional: Comment out sidebar.success if not needed on production
-                # st.sidebar.success(f"Live: {ticker.replace('.NS', '')} = ₹{ltp:.2f}")
-            else:
-                # Optional: Comment out warnings for clean production
-                # st.sidebar.warning(f"No data for {fetch_ticker}")
-            pass
-        except Exception as e:
-            # Optional: Comment out errors
-            # st.sidebar.error(f"yfinance error for {fetch_ticker}: {e}")
-            pass
+        except Exception:
+            pass  # Silently skip
 
         prices[ticker] = ltp
 
@@ -104,15 +97,22 @@ def fetch_live_prices(tickers):
 
 
 # ----------------------------------------------------------------------
-# 4. Build DataFrame
+# 4. Build DataFrame + Robust Nifty Benchmark
 # ----------------------------------------------------------------------
 def build_holdings_df(tickers, holdings):
     prices = fetch_live_prices(tickers)
     nifty_ltp = prices.get('^NSEI')
 
-    nifty_data = yf.Ticker('^NSEI').history(period='1d')
-    nifty_start = nifty_data['Close'].iloc[0] if not nifty_data.empty else None
-    nifty_change = ((nifty_ltp - nifty_start) / nifty_start * 100) if nifty_start and nifty_ltp else 0
+    # Robust Nifty calculation with fallback
+    nifty_change = 0
+    try:
+        nifty_data = yf.Ticker('^NSEI').history(period='1d')
+        if not nifty_data.empty:
+            nifty_start = nifty_data['Close'].iloc[0]
+            if nifty_ltp and pd.notna(nifty_ltp):
+                nifty_change = ((nifty_ltp - nifty_start) / nifty_start * 100)
+    except:
+        nifty_change = 0  # Fallback
 
     rows = []
     for ticker in tickers:
@@ -134,7 +134,7 @@ def build_holdings_df(tickers, holdings):
         invested = qty * avg_price
         current_value = qty * ltp
         unrealized_pl = current_value - invested
-        pct_chg = ((ltp - avg_price) / avg_price) * 100 if avg_price != 0 else 0.0
+        pct_chg = ((ltp - avg_price) / avg_price * 100) if avg_price != 0 else 0.0
 
         rows.append({
             'Ticker': ticker.replace('.NS', ''),
@@ -191,7 +191,29 @@ for t in tickers:
 
 
 # ----------------------------------------------------------------------
-# 7. Dashboard
+# 7. Live LTPs Sidebar (New!)
+# ----------------------------------------------------------------------
+st.sidebar.markdown("### Live LTPs")
+prices = fetch_live_prices(tickers)  # Fresh fetch
+nifty_ltp = prices.get('^NSEI', 'N/A')
+
+# NSE (Nifty 50)
+st.sidebar.markdown(f"**Nifty 50:** ₹{nifty_ltp:,.2f}" if pd.notna(nifty_ltp) else "**Nifty 50:** N/A")
+
+# All stocks LTPs
+for ticker in tickers:
+    ltp = prices.get(ticker, 'N/A')
+    stock_name = ticker.replace('.NS', '')
+    if pd.notna(ltp):
+        st.sidebar.markdown(f"**{stock_name}:** ₹{ltp:,.2f}")
+    else:
+        st.sidebar.markdown(f"**{stock_name}:** N/A")
+
+st.sidebar.markdown(f"*Updated: {st.session_state.last_update.strftime('%H:%M:%S')}*")
+
+
+# ----------------------------------------------------------------------
+# 8. Dashboard
 # ----------------------------------------------------------------------
 df, df_numeric, nifty_change = build_holdings_df(tickers, holdings)
 
