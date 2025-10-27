@@ -2,12 +2,12 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import yfinance as yf
-import time
+import requests
 from datetime import datetime, time
 from collections import defaultdict
 
 # ----------------------------------------------------------------------
-# Page Config & Theme Toggle
+# Page Config & Theme
 # ----------------------------------------------------------------------
 st.set_page_config(page_title="My Groww Portfolio Tracker", layout="wide")
 
@@ -21,7 +21,7 @@ st.title("My Groww Portfolio Tracker")
 
 
 # ----------------------------------------------------------------------
-# 1. Load & clean holdings from CSV
+# 1. Load holdings + FORCE .NS
 # ----------------------------------------------------------------------
 def load_holdings():
     try:
@@ -29,15 +29,11 @@ def load_holdings():
         holdings_df['quantity'] = pd.to_numeric(holdings_df['quantity'], errors='coerce')
         holdings_df['avg_price'] = pd.to_numeric(holdings_df['avg_price'], errors='coerce')
 
-        bad_qty = holdings_df['quantity'].isna()
-        bad_price = holdings_df['avg_price'].isna()
-        if bad_qty.any() or bad_price.any():
-            st.warning(f"Invalid data in holdings.csv: {bad_qty.sum()} bad qty, {bad_price.sum()} bad price")
-
         agg = defaultdict(lambda: {'total_qty': 0, 'total_cost': 0})
         for _, row in holdings_df.iterrows():
             if row['type'] == 'Buy':
-                ticker = str(row['ticker']).strip().upper()
+                raw_ticker = str(row['ticker']).strip().upper()
+                ticker = raw_ticker + '.NS'  # FORCE .NS
                 qty = row['quantity']
                 price = row['avg_price']
                 if pd.notna(qty) and pd.notna(price):
@@ -56,7 +52,7 @@ def load_holdings():
         return tickers, holdings
 
     except Exception as e:
-        st.error(f"Error reading holdings.csv: {e}. Using sample data.")
+        st.error(f"Error reading holdings.csv: {e}")
         tickers = ['ADANIPOWER.NS']
         holdings = {'ADANIPOWER.NS': {'qty': 265, 'avg_price': 104.26}}
         return tickers, holdings
@@ -66,7 +62,7 @@ tickers, holdings = load_holdings()
 
 
 # ----------------------------------------------------------------------
-# 2. Market-open helper
+# 2. Market open?
 # ----------------------------------------------------------------------
 def is_market_open():
     now = datetime.now()
@@ -74,46 +70,46 @@ def is_market_open():
 
 
 # ----------------------------------------------------------------------
-# 3. Fetch live prices (robust + TATAMOTORS fix)
+# 3. Fetch Live Prices (Simplified & Reliable yfinance)
 # ----------------------------------------------------------------------
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=30, show_spinner=False)
 def fetch_live_prices(tickers):
     prices = {}
     all_tickers = tickers + ['^NSEI']
 
     for ticker in all_tickers:
-        if 'TATAMOTORS' in ticker.upper():
-            alt_tickers = ['TATAMOTORS.NS', 'TATAMOTORS.BO', 'TATAMOTORS']
-        else:
-            alt_tickers = [ticker]
+        fetch_ticker = ticker
+        if not fetch_ticker.startswith('^') and not fetch_ticker.endswith('.NS'):
+            fetch_ticker += '.NS'
 
-        found = False
-        for alt in alt_tickers:
-            try:
-                data = yf.Ticker(alt).history(period='1d', interval='1m' if is_market_open() else '1d')
-                if not data.empty and 'Close' in data:
-                    ltp = float(data['Close'].iloc[-1])
-                    prices[ticker] = ltp
-                    print(f"Success: {ticker} → {alt} = {ltp:.2f}")
-                    found = True
-                    break
-            except:
-                continue
-        if not found:
-            prices[ticker] = None
-            print(f"Failed: {ticker}")
+        ltp = None
+        try:
+            data = yf.Ticker(fetch_ticker).history(period='1d', interval='1m' if is_market_open() else '1d')
+            if not data.empty and 'Close' in data.columns:
+                ltp = float(data['Close'].iloc[-1])
+                # Optional: Comment out sidebar.success if not needed on production
+                # st.sidebar.success(f"Live: {ticker.replace('.NS', '')} = ₹{ltp:.2f}")
+            else:
+                # Optional: Comment out warnings for clean production
+                # st.sidebar.warning(f"No data for {fetch_ticker}")
+            pass
+        except Exception as e:
+            # Optional: Comment out errors
+            # st.sidebar.error(f"yfinance error for {fetch_ticker}: {e}")
+            pass
+
+        prices[ticker] = ltp
 
     return prices
 
 
 # ----------------------------------------------------------------------
-# 4. Build DataFrame + Nifty Benchmark (FIXED)
+# 4. Build DataFrame
 # ----------------------------------------------------------------------
 def build_holdings_df(tickers, holdings):
     prices = fetch_live_prices(tickers)
     nifty_ltp = prices.get('^NSEI')
 
-    # FIXED: Safe Nifty start price
     nifty_data = yf.Ticker('^NSEI').history(period='1d')
     nifty_start = nifty_data['Close'].iloc[0] if not nifty_data.empty else None
     nifty_change = ((nifty_ltp - nifty_start) / nifty_start * 100) if nifty_start and nifty_ltp else 0
@@ -128,7 +124,7 @@ def build_holdings_df(tickers, holdings):
         ltp = prices.get(ticker)
 
         if ltp is None or pd.isna(ltp):
-            st.warning(f"Live price unavailable for {ticker}. Using Avg ₹{avg_price:.2f}.")
+            st.warning(f"Live price unavailable for {ticker.replace('.NS', '')}. Using Avg ₹{avg_price:.2f}.")
             ltp = avg_price
             status = "Avg Fallback"
         else:
@@ -157,7 +153,7 @@ def build_holdings_df(tickers, holdings):
     df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
 
     total_current = df['Current Value'].sum()
-    df['Allocation %'] = (df['Current Value'] / total_current * 100).round(2)
+    df['Allocation %'] = (df['Current Value'] / total_current * 100).round(2) if total_current > 0 else 0
     df = df.sort_values('Current Value', ascending=False).reset_index(drop=True)
     df_numeric = df.copy()
 
@@ -165,7 +161,7 @@ def build_holdings_df(tickers, holdings):
 
 
 # ----------------------------------------------------------------------
-# 5. Auto-refresh
+# 5. Controls
 # ----------------------------------------------------------------------
 if 'last_update' not in st.session_state:
     st.session_state.last_update = datetime.now()
@@ -173,6 +169,12 @@ if 'last_update' not in st.session_state:
 st.sidebar.title("Controls")
 if st.sidebar.button("Manual Refresh"):
     st.session_state.last_update = datetime.now()
+    st.cache_data.clear()
+    st.rerun()
+
+if st.sidebar.button("Clear Cache (Local Test)"):
+    st.cache_data.clear()
+    st.success("Cache cleared!")
     st.rerun()
 
 if (datetime.now() - st.session_state.last_update).total_seconds() >= 30:
@@ -181,11 +183,18 @@ if (datetime.now() - st.session_state.last_update).total_seconds() >= 30:
 
 
 # ----------------------------------------------------------------------
-# 6. Dashboard
+# 6. Debug Tickers
+# ----------------------------------------------------------------------
+st.sidebar.markdown("### Debug Tickers")
+for t in tickers:
+    st.sidebar.code(t)
+
+
+# ----------------------------------------------------------------------
+# 7. Dashboard
 # ----------------------------------------------------------------------
 df, df_numeric, nifty_change = build_holdings_df(tickers, holdings)
 
-# Pretty display
 display_df = df.copy()
 fmt_cols = ['Avg Price', 'Live Price', 'Invested', 'Current Value', 'Unrealized P/L', '%Chg', 'Allocation %']
 for c in fmt_cols:
@@ -193,16 +202,13 @@ for c in fmt_cols:
 
 st.dataframe(display_df, use_container_width=True)
 
-# Export Button
-excel_data = df.copy()
 st.download_button(
     label="Download Portfolio as Excel",
-    data=excel_data.to_csv(index=False).encode(),
+    data=df.to_csv(index=False).encode(),
     file_name=f"portfolio_{datetime.now().strftime('%Y%m%d')}.csv",
     mime="text/csv"
 )
 
-# Charts
 col1, col2 = st.columns(2)
 with col1:
     fig_pie = px.pie(df, values='Allocation %', names='Ticker', title='Portfolio Allocation')
@@ -211,7 +217,6 @@ with col2:
     fig_bar = px.bar(df, x='Ticker', y='%Chg', title='Returns %', color='%Chg', color_continuous_scale='RdYlGn')
     st.plotly_chart(fig_bar, use_container_width=True)
 
-# Trend
 try:
     trend_data = yf.download(tickers + ['^NSEI'], period="1mo", progress=False)['Close']
     fig_trend = px.line(trend_data, title='1-Month Trend vs Nifty 50')
@@ -219,7 +224,6 @@ try:
 except:
     st.warning("Trend chart unavailable")
 
-# Metrics
 status = " (Live)" if is_market_open() else " (Closed)"
 st.caption(f"Updated: {st.session_state.last_update.strftime('%Y-%m-%d %H:%M:%S')}{status}")
 
